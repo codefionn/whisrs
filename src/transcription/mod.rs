@@ -7,15 +7,30 @@ pub mod local_parakeet;
 pub mod local_vosk;
 #[cfg(feature = "local-whisper")]
 pub mod local_whisper;
+#[cfg(feature = "local-whisper")]
+pub mod whisper_gpu;
 #[cfg(not(feature = "local-whisper"))]
 pub mod local_whisper {
     //! Stub when local-whisper feature is disabled.
     pub struct LocalWhisperBackend;
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct UnloadPolicy;
+    impl UnloadPolicy {
+        pub fn from_config(_idle_unload_secs: u64, _gpu_min_free_mb: u64) -> Self {
+            Self
+        }
+    }
     impl LocalWhisperBackend {
         pub fn new(_model_path: String) -> Self {
             Self
         }
+        pub fn with_gpu(_model_path: String, _gpu: Option<&crate::GpuSelect>) -> Self {
+            Self
+        }
         pub fn with_segmentation(self, _mode: &str, _phrase_silence_ms: u64) -> Self {
+            self
+        }
+        pub fn with_unload_policy(self, _policy: UnloadPolicy) -> Self {
             self
         }
     }
@@ -27,6 +42,10 @@ pub mod local_whisper {
             _config: &super::TranscriptionConfig,
         ) -> anyhow::Result<String> {
             anyhow::bail!("local-whisper feature not enabled — rebuild with: cargo build --features local-whisper")
+        }
+
+        fn unload_model(&self) -> super::ModelUnload {
+            super::ModelUnload::NoLocalModel
         }
 
         // Unreachable: `transcribe` bails before a request exists. `false`
@@ -69,6 +88,18 @@ pub struct TranscriptionConfig {
     /// keyterms either. Backends with no equivalent parameter ignore these —
     /// they receive the same terms folded into `prompt`.
     pub keyterms: Vec<String>,
+}
+
+/// What [`TranscriptionBackend::unload_model`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelUnload {
+    /// The model was in memory and has been released. A transcription still
+    /// running keeps its copy until it finishes.
+    Unloaded,
+    /// The backend has a local model, but it was not loaded.
+    NotLoaded,
+    /// The backend runs remotely or out of process; there is nothing to free.
+    NoLocalModel,
 }
 
 /// Trait for transcription backends.
@@ -147,4 +178,9 @@ pub trait TranscriptionBackend: Send + Sync {
     /// sends it for one model and not for another. Backends whose answer is
     /// fixed ignore the argument.
     fn sends_prompt(&self, config: &TranscriptionConfig) -> bool;
+
+    /// Release an in-process model (e.g. GPU memory) on request; the next
+    /// transcription loads it again. Required, not defaulted: a backend that
+    /// gains a local model must decide what unloading means for it.
+    fn unload_model(&self) -> ModelUnload;
 }

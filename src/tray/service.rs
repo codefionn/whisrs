@@ -201,6 +201,15 @@ impl ksni::Tray for WhisrsTray {
                 ..Default::default()
             }),
             MenuItem::Separator,
+            // Frees GPU memory on demand; the idle/pressure rules in
+            // `[local-whisper]` do the same automatically.
+            MenuItem::Standard(StandardItem {
+                label: "Unload Model".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    tray.send(Command::Unload);
+                }),
+                ..Default::default()
+            }),
             MenuItem::Standard(StandardItem {
                 label: "Restart Daemon".to_string(),
                 activate: Box::new(|tray: &mut Self| {

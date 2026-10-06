@@ -7,7 +7,7 @@ use whisrs::transcription::deepgram::{DeepgramRestBackend, DeepgramStreamingBack
 use whisrs::transcription::groq::GroqBackend;
 use whisrs::transcription::local_parakeet::ParakeetBackend;
 use whisrs::transcription::local_vosk::VoskBackend;
-use whisrs::transcription::local_whisper::LocalWhisperBackend;
+use whisrs::transcription::local_whisper::{LocalWhisperBackend, UnloadPolicy};
 use whisrs::transcription::openai_compatible_realtime::OpenAiCompatibleRealtimeBackend;
 use whisrs::transcription::openai_realtime::OpenAIRealtimeBackend;
 use whisrs::transcription::openai_rest::OpenAIRestBackend;
@@ -178,10 +178,12 @@ pub(crate) fn create_backend(config: &Config) -> Arc<dyn TranscriptionBackend> {
                 local_whisper.model_path, local_whisper.segmentation
             );
             Arc::new(
-                LocalWhisperBackend::new(local_whisper.model_path).with_segmentation(
-                    &local_whisper.segmentation,
-                    local_whisper.phrase_silence_ms,
-                ),
+                LocalWhisperBackend::with_gpu(local_whisper.model_path, local_whisper.gpu.as_ref())
+                    .with_segmentation(&local_whisper.segmentation, local_whisper.phrase_silence_ms)
+                    .with_unload_policy(UnloadPolicy::from_config(
+                        local_whisper.idle_unload_secs,
+                        local_whisper.gpu_min_free_mb,
+                    )),
             )
         }
         "local-vosk" => {

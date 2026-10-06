@@ -11,7 +11,7 @@ use crate::audio::AudioChunk;
 use super::openai_realtime_protocol::{
     OpenAiRealtimeProfile, OpenAiRealtimeProtocolEngine, RealtimeEngineConfig, TurnDetectionMode,
 };
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{ModelUnload, TranscriptionBackend, TranscriptionConfig};
 
 /// External OpenAI-compatible realtime backend.
 #[derive(Debug)]
@@ -139,6 +139,10 @@ impl TranscriptionBackend for OpenAiCompatibleRealtimeBackend {
 
     fn supports_streaming(&self) -> bool {
         true
+    }
+
+    fn unload_model(&self) -> ModelUnload {
+        ModelUnload::NoLocalModel
     }
 
     // Statically false, exactly like Deepgram (issue #133). `new` rejects

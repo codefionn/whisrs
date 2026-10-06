@@ -59,6 +59,8 @@ src/
 ├── state.rs                # State machine (Idle → Recording → Transcribing → Idle;
 │                           #   read-aloud: Idle → Synthesizing → Speaking → Idle)
 ├── history.rs              # Dictation history (whisrs log)
+├── gpu_memory/             # Per-vendor VRAM readers: amdgpu sysfs, Intel xe/i915 query
+│                           #   ioctls (+ fdinfo fallback), NVIDIA NVML via dlopen
 ├── llm.rs                  # LLM calls for command mode
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
@@ -77,7 +79,8 @@ src/
 │   ├── openai_compatible_realtime.rs  # Lemonade + other OpenAI-compatible realtime
 │   ├── openai_rest.rs      # OpenAI REST API (simple HTTP POST)
 │   ├── asr_sidecar.rs      # Generic HTTP ASR sidecar backend
-│   ├── local_whisper.rs    # Local whisper.cpp via whisper-rs (feature-gated)
+│   ├── local_whisper.rs    # Local whisper.cpp via whisper-rs (feature-gated); idle/VRAM-pressure unload
+│   ├── whisper_gpu.rs      # `[local-whisper] gpu` selector over ggml's device registry
 │   ├── phrase_split.rs     # Silence-delimited phrase segmentation (default since #57)
 │   ├── local_vosk.rs       # Vosk backend stub (coming soon)
 │   └── local_parakeet.rs   # Parakeet/NVIDIA backend stub (coming soon)
@@ -200,6 +203,7 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
 {"cmd": "speak"}                     // alias: "read". Repeat or cancel stops playback.
+{"cmd": "unload"}                    // free the local model (GPU memory); next dictation reloads
 ```
 
 Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": "..."}`,

@@ -51,6 +51,9 @@ pub enum Command {
     /// stops any in-progress playback.
     #[serde(alias = "read")]
     Speak,
+    /// Free the local transcription model (and its GPU memory) now. The next
+    /// dictation reloads it. An error for backends without a local model.
+    Unload,
 }
 
 fn default_log_limit() -> usize {
@@ -281,6 +284,14 @@ mod tests {
     fn speak_command_roundtrip() {
         let parsed: Command = serde_json::from_str(r#"{"cmd":"speak"}"#).unwrap();
         assert!(matches!(parsed, Command::Speak));
+    }
+
+    #[test]
+    fn unload_command_roundtrip() {
+        let json = serde_json::to_string(&Command::Unload).unwrap();
+        assert_eq!(json, r#"{"cmd":"unload"}"#);
+        let parsed: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Command::Unload));
     }
 
     #[test]

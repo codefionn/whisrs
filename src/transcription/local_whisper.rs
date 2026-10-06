@@ -29,10 +29,16 @@
 //! Both streaming modes create one decoder state per stream and reuse it
 //! across decodes; see [`create_state`].
 //!
+//! A background thread can drop the model (and its GPU buffers) once no
+//! transcription has run for `idle_unload_secs`, or when the GPU it lives on
+//! runs below `gpu_min_free_mb` of free VRAM; the next dictation reloads it
+//! from disk. See [`ModelSlot`] and [`UnloadPolicy`].
+//!
 //! [`supports_streaming`]: TranscriptionBackend::supports_streaming
 //! [`transcribe`]: TranscriptionBackend::transcribe
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use asr_dedup::TextDedup;
 use async_trait::async_trait;
@@ -40,8 +46,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::phrase_split::PhraseSplitter;
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::whisper_gpu::{self, GpuSelection};
+use super::{ModelUnload, TranscriptionBackend, TranscriptionConfig};
 use crate::audio::AudioChunk;
+use crate::gpu_memory;
 
 /// Sliding window parameters for the legacy "window" streaming mode.
 const WINDOW_SECS: usize = 8;
@@ -89,10 +97,263 @@ impl SegmentationMode {
     }
 }
 
+/// The loaded model, shared between the backend and its idle reaper.
+///
+/// Users take a [`ModelLease`], which clones the context `Arc`; unloading
+/// only drops the slot's own reference, so a decode in flight keeps its
+/// context alive and the GPU memory is freed when the last lease ends.
+struct ModelSlot {
+    path: String,
+    gpu: GpuSelection,
+    state: Mutex<SlotState>,
+}
+
+struct SlotState {
+    ctx: Option<Arc<whisper_rs::WhisperContext>>,
+    /// Leases currently held. The reaper never unloads while this is > 0.
+    active: usize,
+    /// When the last lease ended (or the model was loaded).
+    last_used: Instant,
+}
+
+impl ModelSlot {
+    fn new(path: String, gpu: GpuSelection, ctx: Option<whisper_rs::WhisperContext>) -> Self {
+        Self {
+            path,
+            gpu,
+            state: Mutex::new(SlotState {
+                ctx: ctx.map(Arc::new),
+                active: 0,
+                last_used: Instant::now(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SlotState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Take a lease on the model, loading it first if it was unloaded.
+    ///
+    /// Blocking: a reload reads the whole model file. Call it off the async
+    /// runtime (see [`LocalWhisperBackend::lease`]).
+    fn acquire(self: &Arc<Self>) -> anyhow::Result<ModelLease> {
+        let mut state = self.lock();
+        let ctx = match &state.ctx {
+            Some(ctx) => Arc::clone(ctx),
+            None => {
+                // Holding the lock across the load makes a concurrent
+                // acquire wait for this load instead of starting a second one.
+                let ctx = Arc::new(
+                    LocalWhisperBackend::load_model(&self.path, &self.gpu).map_err(|e| {
+                        anyhow::anyhow!("whisper model not loaded from {}: {e}", self.path)
+                    })?,
+                );
+                info!("reloaded whisper model from {}", self.path);
+                state.ctx = Some(Arc::clone(&ctx));
+                ctx
+            }
+        };
+        state.active += 1;
+        Ok(ModelLease {
+            ctx,
+            slot: Arc::clone(self),
+        })
+    }
+
+    /// Whether the model is loaded and nobody has used it for `timeout`.
+    fn idle_for(&self, timeout: Duration) -> bool {
+        let state = self.lock();
+        state.ctx.is_some() && state.active == 0 && state.last_used.elapsed() >= timeout
+    }
+
+    /// Drop the model now. A lease in flight keeps its context until done.
+    fn unload(&self) -> bool {
+        self.lock().ctx.take().is_some()
+    }
+
+    /// Drop the model if it has been idle for at least `timeout`.
+    fn unload_if_idle(&self, timeout: Duration) -> bool {
+        let mut state = self.lock();
+        if state.ctx.is_some() && state.active == 0 && state.last_used.elapsed() >= timeout {
+            state.ctx = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A held reference to the loaded model; marks the slot as in use until
+/// dropped.
+struct ModelLease {
+    ctx: Arc<whisper_rs::WhisperContext>,
+    slot: Arc<ModelSlot>,
+}
+
+impl Drop for ModelLease {
+    fn drop(&mut self) {
+        let mut state = self.slot.lock();
+        state.active -= 1;
+        state.last_used = Instant::now();
+    }
+}
+
+/// When the reaper frees the model. Each rule is off when `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnloadPolicy {
+    /// Unload after this long without a transcription.
+    pub idle: Option<Duration>,
+    /// Unload once the GPU holding the model has less free VRAM than this
+    /// many bytes (and the model has sat unused for [`PRESSURE_GRACE`]).
+    pub gpu_min_free: Option<u64>,
+}
+
+impl UnloadPolicy {
+    /// From the `[local-whisper]` keys; `0` turns a rule off.
+    pub fn from_config(idle_unload_secs: u64, gpu_min_free_mb: u64) -> Self {
+        Self {
+            idle: (idle_unload_secs > 0).then(|| Duration::from_secs(idle_unload_secs)),
+            gpu_min_free: (gpu_min_free_mb > 0).then_some(gpu_min_free_mb.saturating_mul(1 << 20)),
+        }
+    }
+
+    fn is_off(&self) -> bool {
+        self.idle.is_none() && self.gpu_min_free.is_none()
+    }
+
+    /// How often the reaper wakes.
+    fn tick(&self) -> Duration {
+        let idle_tick = self
+            .idle
+            .map(|t| (t / 4).clamp(Duration::from_secs(1), Duration::from_secs(30)));
+        let pressure_tick = self.gpu_min_free.map(|_| PRESSURE_POLL);
+        match (idle_tick, pressure_tick) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b).unwrap_or(Duration::from_secs(30)),
+        }
+    }
+}
+
+/// How often VRAM is sampled when `gpu_min_free_mb` is set.
+const PRESSURE_POLL: Duration = Duration::from_secs(5);
+/// Memory pressure never unloads a model used within this window, so
+/// back-to-back dictations do not reload it each time.
+const PRESSURE_GRACE: Duration = Duration::from_secs(10);
+
+/// The GPU with the least free VRAM below `min_free` among those this
+/// process holds memory on. Falls back to every readable GPU when ownership
+/// cannot be told (e.g. a driver without fdinfo memory stats).
+fn gpu_under_pressure(
+    min_free: u64,
+    selected: Option<&str>,
+) -> Option<(gpu_memory::GpuDevice, gpu_memory::VramUsage)> {
+    // The GPU whisper.cpp was told to use is authoritative; fdinfo is the
+    // fallback when the backend reports no PCI address.
+    let own = match selected {
+        Some(addr) => vec![addr.to_string()],
+        None => gpu_memory::own_devices(),
+    };
+    gpu_memory::devices()
+        .into_iter()
+        .filter(|d| own.is_empty() || own.contains(&d.pci_addr))
+        .filter_map(|d| gpu_memory::usage(&d).map(|u| (d, u)))
+        .filter(|(_, u)| u.free() < min_free)
+        .min_by_key(|(_, u)| u.free())
+}
+
+/// Why the VRAM-pressure rule cannot apply to `gpu`, if it cannot.
+///
+/// An integrated GPU's "VRAM" is a small carve-out of system RAM that the
+/// driver overflows into GTT, so it reads as nearly full whenever a model is
+/// loaded; acting on it would unload after every dictation.
+fn pressure_exempt(gpu: &GpuSelection) -> Option<&'static str> {
+    if !gpu.use_gpu {
+        Some("the model runs on the CPU")
+    } else if gpu.gpu.as_ref().is_some_and(|g| g.integrated) {
+        Some("the model runs on an integrated GPU, which shares system RAM")
+    } else {
+        None
+    }
+}
+
+/// Log what the pressure rule can see, so an unsupported GPU is visible in
+/// the journal instead of silently never triggering.
+fn log_gpu_readers() {
+    let devices = gpu_memory::devices();
+    if devices.is_empty() {
+        warn!("gpu_min_free_mb is set but no GPU was found in /sys/class/drm");
+        return;
+    }
+    for d in &devices {
+        match gpu_memory::usage(d) {
+            Some(u) => info!(
+                "GPU {} ({}, {:?}): {} MiB VRAM, {} MiB free",
+                d.pci_addr,
+                d.vendor_name(),
+                d.driver,
+                u.total >> 20,
+                u.free() >> 20
+            ),
+            None => info!(
+                "GPU {} ({}, {:?}): VRAM usage not readable; ignored for gpu_min_free_mb",
+                d.pci_addr,
+                d.vendor_name(),
+                d.driver
+            ),
+        }
+    }
+}
+
+/// Poll the slot and unload the model when `policy` says so. Exits once the
+/// backend (the only strong owner besides leases) is gone.
+fn spawn_reaper(slot: Weak<ModelSlot>, policy: UnloadPolicy) {
+    let tick = policy.tick();
+    let spawned = std::thread::Builder::new()
+        .name("whisper-unload".into())
+        .spawn(move || loop {
+            std::thread::sleep(tick);
+            let Some(slot) = slot.upgrade() else { break };
+            if let Some(timeout) = policy.idle {
+                if slot.unload_if_idle(timeout) {
+                    info!(
+                        "unloaded whisper model after {}s idle; next dictation reloads it",
+                        timeout.as_secs()
+                    );
+                    continue;
+                }
+            }
+            let Some(min_free) = policy.gpu_min_free else {
+                continue;
+            };
+            // Cheap check first: sampling VRAM walks sysfs and /proc.
+            if !slot.idle_for(PRESSURE_GRACE) {
+                continue;
+            }
+            let selected = slot.gpu.gpu.as_ref().and_then(|g| g.pci_addr.as_deref());
+            let Some((dev, usage)) = gpu_under_pressure(min_free, selected) else {
+                continue;
+            };
+            if slot.unload_if_idle(PRESSURE_GRACE) {
+                info!(
+                    "unloaded whisper model: GPU {} ({}) has {} MiB of {} MiB free, \
+                     below gpu_min_free_mb = {}; next dictation reloads it",
+                    dev.pci_addr,
+                    dev.vendor_name(),
+                    usage.free() >> 20,
+                    usage.total >> 20,
+                    min_free >> 20
+                );
+            }
+        });
+    if let Err(e) = spawned {
+        warn!("failed to start whisper unload thread: {e}");
+    }
+}
+
 /// Local whisper.cpp transcription backend.
 pub struct LocalWhisperBackend {
-    ctx: Option<Arc<whisper_rs::WhisperContext>>,
-    model_path: String,
+    slot: Arc<ModelSlot>,
     segmentation: SegmentationMode,
     phrase_silence_ms: u64,
 }
@@ -103,10 +364,17 @@ impl LocalWhisperBackend {
     /// Defaults to silence-delimited phrase segmentation; see
     /// [`Self::with_segmentation`].
     pub fn new(model_path: String) -> Self {
-        let ctx = match Self::load_model(&model_path) {
+        Self::with_gpu(model_path, None)
+    }
+
+    /// Like [`Self::new`], on the GPU the `[local-whisper] gpu` setting
+    /// names (see [`whisper_gpu`]).
+    pub fn with_gpu(model_path: String, gpu: Option<&crate::GpuSelect>) -> Self {
+        let gpu = whisper_gpu::resolve(gpu);
+        let ctx = match Self::load_model(&model_path, &gpu) {
             Ok(ctx) => {
                 info!("loaded whisper model from {model_path}");
-                Some(Arc::new(ctx))
+                Some(ctx)
             }
             Err(e) => {
                 warn!("failed to load whisper model from {model_path}: {e}");
@@ -114,8 +382,7 @@ impl LocalWhisperBackend {
             }
         };
         Self {
-            ctx,
-            model_path,
+            slot: Arc::new(ModelSlot::new(model_path, gpu, ctx)),
             segmentation: SegmentationMode::default(),
             // Same default as `crate::LocalWhisperConfig` — lib.rs is the
             // single source of truth for segmentation defaults.
@@ -134,12 +401,40 @@ impl LocalWhisperBackend {
         self
     }
 
-    fn load_model(path: &str) -> anyhow::Result<whisper_rs::WhisperContext> {
+    /// Free the model from memory per `policy`; the next transcription
+    /// reloads it. The default policy keeps it loaded for good.
+    pub fn with_unload_policy(self, mut policy: UnloadPolicy) -> Self {
+        if policy.gpu_min_free.is_some() {
+            if let Some(why) = pressure_exempt(&self.slot.gpu) {
+                info!("gpu_min_free_mb ignored: {why}");
+                policy.gpu_min_free = None;
+            } else {
+                log_gpu_readers();
+            }
+        }
+        if !policy.is_off() {
+            spawn_reaper(Arc::downgrade(&self.slot), policy);
+        }
+        self
+    }
+
+    /// Lease the model, reloading it off the async runtime if it was
+    /// unloaded for idleness.
+    async fn lease(&self) -> anyhow::Result<ModelLease> {
+        let slot = Arc::clone(&self.slot);
+        tokio::task::spawn_blocking(move || slot.acquire()).await?
+    }
+
+    fn load_model(path: &str, gpu: &GpuSelection) -> anyhow::Result<whisper_rs::WhisperContext> {
         if !std::path::Path::new(path).exists() {
             anyhow::bail!("model file not found: {path}. Run 'whisrs setup' to download a model.");
         }
 
-        let params = whisper_rs::WhisperContextParameters::default();
+        let mut params = whisper_rs::WhisperContextParameters::default();
+        // `use_gpu` defaults to whether this build has a GPU backend; only
+        // ever turn it off, never on for a CPU-only build.
+        params.use_gpu = params.use_gpu && gpu.use_gpu;
+        params.gpu_device = gpu.device;
 
         whisper_rs::WhisperContext::new_with_params(path, params)
             .map_err(|e| anyhow::anyhow!("failed to initialize whisper context: {e}"))
@@ -526,12 +821,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
         audio: &[u8],
         config: &TranscriptionConfig,
     ) -> anyhow::Result<String> {
-        let ctx = self.ctx.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "whisper model not loaded from {}. Run 'whisrs setup' to download a model.",
-                self.model_path
-            )
-        })?;
+        let lease = self.lease().await?;
 
         // Decode WAV to i16 samples, then convert to f32.
         let cursor = std::io::Cursor::new(audio);
@@ -541,7 +831,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
         whisper_rs::convert_integer_to_float_audio(&samples_i16, &mut samples_f32)
             .map_err(|e| anyhow::anyhow!("failed to convert audio: {e}"))?;
 
-        let ctx = Arc::clone(ctx);
+        let ctx = Arc::clone(&lease.ctx);
         let language = config.language.clone();
         let prompt = config.prompt.clone();
 
@@ -550,6 +840,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
             run_whisper_inference(&mut state, &samples_f32, &language, prompt.as_deref())
         })
         .await?
+        // `lease` drops here, after the decode, so idle time counts from now.
     }
 
     async fn transcribe_stream(
@@ -558,10 +849,8 @@ impl TranscriptionBackend for LocalWhisperBackend {
         text_tx: mpsc::Sender<String>,
         config: &TranscriptionConfig,
     ) -> anyhow::Result<()> {
-        let ctx = self
-            .ctx
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("whisper model not loaded from {}", self.model_path))?;
+        let lease = self.lease().await?;
+        let ctx = &lease.ctx;
 
         match self.segmentation {
             SegmentationMode::Silence => self.stream_phrases(ctx, audio_rx, text_tx, config).await,
@@ -577,6 +866,15 @@ impl TranscriptionBackend for LocalWhisperBackend {
     // `transcribe` once on stop, instead of typing phrases as they end.
     fn supports_streaming(&self) -> bool {
         self.segmentation != SegmentationMode::Unsegmented
+    }
+
+    fn unload_model(&self) -> ModelUnload {
+        if self.slot.unload() {
+            info!("unloaded whisper model on request; next dictation reloads it");
+            ModelUnload::Unloaded
+        } else {
+            ModelUnload::NotLoaded
+        }
     }
 
     // `run_whisper_inference` hands the prompt to `set_initial_prompt`, so
@@ -655,6 +953,62 @@ mod tests {
     fn decapitalize_first_still_lowercases_i_words() {
         assert_eq!(decapitalize_first("It works"), "it works");
         assert_eq!(decapitalize_first("Instead of that"), "instead of that");
+    }
+
+    #[test]
+    fn unload_policy_from_config() {
+        assert!(UnloadPolicy::from_config(0, 0).is_off());
+        let p = UnloadPolicy::from_config(300, 1024);
+        assert_eq!(p.idle, Some(Duration::from_secs(300)));
+        assert_eq!(p.gpu_min_free, Some(1 << 30));
+        // Pressure polling wins over the slower idle tick.
+        assert_eq!(p.tick(), PRESSURE_POLL);
+        assert_eq!(
+            UnloadPolicy::from_config(8, 0).tick(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(UnloadPolicy::from_config(0, 512).tick(), PRESSURE_POLL);
+    }
+
+    #[test]
+    fn unload_on_request_reports_whether_anything_was_freed() {
+        let backend = LocalWhisperBackend::new("/nonexistent/model.bin".to_string());
+        assert_eq!(backend.unload_model(), ModelUnload::NotLoaded);
+    }
+
+    #[test]
+    fn pressure_rule_skips_cpu_and_integrated_gpus() {
+        let on = |integrated: bool| GpuSelection {
+            use_gpu: true,
+            device: 0,
+            gpu: Some(whisper_gpu::WhisperGpu {
+                index: 0,
+                name: "Vulkan0".into(),
+                description: String::new(),
+                integrated,
+                pci_addr: None,
+            }),
+        };
+        assert!(pressure_exempt(&on(false)).is_none());
+        assert!(pressure_exempt(&on(true)).is_some());
+        let cpu = GpuSelection {
+            use_gpu: false,
+            device: 0,
+            gpu: None,
+        };
+        assert!(pressure_exempt(&cpu).is_some());
+    }
+
+    #[test]
+    fn unloaded_slot_is_never_idle() {
+        let gpu = GpuSelection {
+            use_gpu: false,
+            device: 0,
+            gpu: None,
+        };
+        let slot = ModelSlot::new("/nonexistent".into(), gpu, None);
+        assert!(!slot.idle_for(Duration::ZERO));
+        assert!(!slot.unload_if_idle(Duration::ZERO));
     }
 
     #[test]

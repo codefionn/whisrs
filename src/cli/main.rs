@@ -91,6 +91,8 @@ enum SubCmd {
     Speak,
     /// Restart the whisrs daemon (uses the systemd or OpenRC user service when present)
     Restart,
+    /// Free the local model (and its GPU memory); the next dictation reloads it
+    Unload,
 }
 
 /// Check if stdout is a TTY for color support.
@@ -169,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
         }
         SubCmd::Restart => {
             cmd_restart()?;
+        }
+        SubCmd::Unload => {
+            send_command(Command::Unload).await?;
         }
     }
 

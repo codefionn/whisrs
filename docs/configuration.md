@@ -290,6 +290,25 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 # mode (ignored by "window" and "none"). Lower = snappier output, higher =
 # fewer mid-sentence splits.
 # phrase_silence_ms = 400
+# idle_unload_secs: free the model (and its GPU memory) after this many
+# seconds without a transcription. The next dictation reloads it from disk,
+# which delays that first result by the load time (about a second per GB on
+# a fast SSD). 0 keeps the model loaded for good.
+# idle_unload_secs = 0
+# gpu_min_free_mb: free the model once the GPU it lives on has less free
+# VRAM than this many MiB, so a game or another model can have the memory.
+# Only kicks in after 10 s without a transcription. Ignored when the model
+# runs on an integrated GPU or the CPU (their memory is system RAM). VRAM is read per vendor:
+# amdgpu sysfs, the Intel xe/i915 memory queries (Arc), and NVIDIA NVML.
+# The daemon logs at startup which GPUs it can read. 0 disables the check.
+# gpu_min_free_mb = 0
+# gpu: which GPU runs the model (GPU builds only, e.g. --features vulkan).
+# An index (0, 1, ... matching Vulkan0, Vulkan1 in the daemon log),
+# "dedicated", "integrated", a PCI address ("0000:07:00.0"), "cpu", or
+# "auto" (the first GPU). The daemon logs the GPUs it found at startup.
+# gpu = "auto"
+#
+# `whisrs unload` (or "Unload Model" in the tray menu) frees the model now.
 
 # Generic local ASR sidecar — talks to a small HTTP service that hosts the
 # model (Moonshine, NVIDIA Parakeet, Microsoft VibeVoice-ASR, …). Keeps

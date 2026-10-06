@@ -643,6 +643,31 @@ pub struct LocalWhisperConfig {
     /// segmentation mode.
     #[serde(default = "default_phrase_silence_ms")]
     pub phrase_silence_ms: u64,
+    /// Seconds without a transcription after which the model is dropped
+    /// from (GPU) memory; the next dictation reloads it. `0` (default)
+    /// keeps it loaded for the daemon's lifetime.
+    #[serde(default)]
+    pub idle_unload_secs: u64,
+    /// Unload the model once the GPU holding it has less free VRAM than
+    /// this many MiB, so a game or another model can take the memory.
+    /// Read per vendor (amdgpu sysfs, Intel xe/i915 queries, NVIDIA NVML).
+    /// `0` (default) disables the check.
+    #[serde(default)]
+    pub gpu_min_free_mb: u64,
+    /// Which GPU whisper.cpp runs on: an index (`0`, `1`, … as `Vulkan<n>`
+    /// in the daemon log), `"dedicated"`, `"integrated"`, a PCI address
+    /// (`"0000:07:00.0"`), `"cpu"` to skip the GPU, or `"auto"` (default:
+    /// whisper.cpp's first GPU). Only matters for GPU builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuSelect>,
+}
+
+/// `[local-whisper] gpu`: a bare index or a name. Interpreted by the backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GpuSelect {
+    Index(u32),
+    Name(String),
 }
 
 impl LocalWhisperConfig {
@@ -652,6 +677,9 @@ impl LocalWhisperConfig {
             model_path,
             segmentation: default_local_whisper_segmentation(),
             phrase_silence_ms: default_phrase_silence_ms(),
+            idle_unload_secs: 0,
+            gpu_min_free_mb: 0,
+            gpu: None,
         }
     }
 
@@ -2615,6 +2643,25 @@ mod tests {
         assert_eq!(from_serde.model_path, from_default.model_path);
         assert_eq!(from_serde.segmentation, from_default.segmentation);
         assert_eq!(from_serde.phrase_silence_ms, from_default.phrase_silence_ms);
+        assert_eq!(from_serde.idle_unload_secs, from_default.idle_unload_secs);
+        assert_eq!(from_serde.gpu_min_free_mb, from_default.gpu_min_free_mb);
+        assert_eq!(from_serde.gpu, from_default.gpu);
+    }
+
+    #[test]
+    fn local_whisper_gpu_accepts_index_or_name() {
+        let parse = |v: &str| {
+            let c: Config = toml::from_str(&format!(
+                "[general]\nbackend = \"local-whisper\"\n[local-whisper]\ngpu = {v}\n"
+            ))
+            .unwrap();
+            c.local_whisper.unwrap().gpu
+        };
+        assert_eq!(parse("1"), Some(GpuSelect::Index(1)));
+        assert_eq!(
+            parse("\"integrated\""),
+            Some(GpuSelect::Name("integrated".into()))
+        );
     }
 
     #[test]

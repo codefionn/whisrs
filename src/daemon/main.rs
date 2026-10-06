@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use whisrs::history;
+use whisrs::transcription::ModelUnload;
 use whisrs::window::{self, WindowTracker};
 use whisrs::{encode_message, read_message, socket_path, Command, Response, State};
 
@@ -296,6 +297,22 @@ async fn handle_command(
             handle_set_llm_instruction(daemon_state, context, name).await
         }
         Command::Speak => handle_speak(daemon_state, context).await,
+        Command::Unload => {
+            let state = daemon_state.lock().await.state_machine.state();
+            match context.transcription_backend.unload_model() {
+                ModelUnload::Unloaded => Response::Ok { state },
+                ModelUnload::NotLoaded => {
+                    info!("unload requested; model was not loaded");
+                    Response::Ok { state }
+                }
+                ModelUnload::NoLocalModel => Response::Error {
+                    message: format!(
+                        "backend {:?} has no local model to unload",
+                        context.config.general.backend
+                    ),
+                },
+            }
+        }
     }
 }
 

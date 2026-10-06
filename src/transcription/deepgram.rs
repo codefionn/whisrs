@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::audio::AudioChunk;
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{ModelUnload, TranscriptionBackend, TranscriptionConfig};
 
 /// Deepgram REST API endpoint for pre-recorded audio.
 const DEEPGRAM_REST_URL: &str = "https://api.deepgram.com/v1/listen";
@@ -417,6 +417,10 @@ impl TranscriptionBackend for DeepgramRestBackend {
     // Uses the default transcribe_stream (collect + transcribe) since this
     // backend does not support streaming.
 
+    fn unload_model(&self) -> ModelUnload {
+        ModelUnload::NoLocalModel
+    }
+
     // Deepgram has no prompt field; vocabulary rides as `keyterm` params.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
         false
@@ -613,6 +617,10 @@ impl TranscriptionBackend for DeepgramStreamingBackend {
 
     fn supports_streaming(&self) -> bool {
         true
+    }
+
+    fn unload_model(&self) -> ModelUnload {
+        ModelUnload::NoLocalModel
     }
 
     // Same as the REST backend: no prompt field on the wire, vocabulary rides

@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use crate::audio::wav::encode_wav;
 use crate::audio::AudioChunk;
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{ModelUnload, TranscriptionBackend, TranscriptionConfig};
 
 /// Maximum file size accepted by the Groq API (25 MB).
 const MAX_FILE_SIZE: usize = 25 * 1024 * 1024;
@@ -347,6 +347,10 @@ impl TranscriptionBackend for GroqBackend {
 
     fn supports_streaming(&self) -> bool {
         false
+    }
+
+    fn unload_model(&self) -> ModelUnload {
+        ModelUnload::NoLocalModel
     }
 
     // Whisper's `prompt` multipart field, set by both request builders

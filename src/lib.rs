@@ -2,6 +2,8 @@
 
 pub mod audio;
 pub mod config;
+#[cfg(feature = "local-whisper")]
+pub mod gpu_memory;
 pub mod history;
 #[cfg(feature = "hooks")]
 pub mod hooks;

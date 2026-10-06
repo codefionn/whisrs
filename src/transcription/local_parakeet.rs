@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{ModelUnload, TranscriptionBackend, TranscriptionConfig};
 
 /// Parakeet-based local transcription backend.
 pub struct ParakeetBackend {
@@ -32,6 +32,10 @@ impl TranscriptionBackend for ParakeetBackend {
             "Parakeet backend is not yet implemented. \
              Use the `local-whisper` backend instead, or check back in a future release."
         )
+    }
+
+    fn unload_model(&self) -> ModelUnload {
+        ModelUnload::NoLocalModel
     }
 
     // Unreachable: `transcribe` bails before a request exists. `false` is

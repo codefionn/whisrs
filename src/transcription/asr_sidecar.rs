@@ -8,7 +8,7 @@ use reqwest::multipart;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{ModelUnload, TranscriptionBackend, TranscriptionConfig};
 
 /// Keep a guardrail so a runaway recording does not create an unbounded
 /// multipart request.
@@ -184,6 +184,10 @@ impl TranscriptionBackend for AsrSidecarBackend {
 
     // Uses the default transcribe_stream (collect + transcribe). Model-specific
     // streaming behavior belongs in the sidecar process.
+
+    fn unload_model(&self) -> ModelUnload {
+        ModelUnload::NoLocalModel
+    }
 
     // The prompt does reach the sidecar, just under a different name: it is
     // sent as the `hotwords` multipart field.

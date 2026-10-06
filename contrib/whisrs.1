@@ -130,6 +130,18 @@ otherwise prints guidance for manual restart. Does not require the daemon
 to be running \(em
 .B restart
 will start a stopped service.
+.TP
+.B unload
+Free the local transcription model and the GPU memory it holds. The next
+dictation loads it again. Also available as
+.B Unload Model
+in the tray menu. Fails for backends without a local model. See
+.B idle_unload_secs
+and
+.B gpu_min_free_mb
+in
+.I config.toml
+to unload automatically.
 .SH LLM OUTPUT
 Applies to
 .B command

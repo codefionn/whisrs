@@ -115,6 +115,8 @@ features = ["std", "simd"]
 
 [dependencies.whisper-rs]
 version = "0.16"
+# `raw-api` re-exports whisper-rs-sys, used to list ggml GPUs for `[local-whisper] gpu`.
+features = ["raw-api"]
 optional = true
 
 [dev-dependencies]

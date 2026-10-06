@@ -8,7 +8,7 @@ use reqwest::multipart;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{ModelUnload, TranscriptionBackend, TranscriptionConfig};
 
 /// Maximum file size accepted by the OpenAI API (25 MB).
 const MAX_FILE_SIZE: usize = 25 * 1024 * 1024;
@@ -154,6 +154,10 @@ impl TranscriptionBackend for OpenAIRestBackend {
 
     // Uses the default transcribe_stream (collect + transcribe) since this
     // backend does not support streaming.
+
+    fn unload_model(&self) -> ModelUnload {
+        ModelUnload::NoLocalModel
+    }
 
     // `transcribe` puts the prompt on the wire as the `prompt` multipart field.
     fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {

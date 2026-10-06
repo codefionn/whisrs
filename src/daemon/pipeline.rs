@@ -1808,6 +1808,10 @@ mod tests {
             Ok(self.text.to_string())
         }
 
+        fn unload_model(&self) -> whisrs::transcription::ModelUnload {
+            whisrs::transcription::ModelUnload::NoLocalModel
+        }
+
         fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
             self.sends_prompt
         }

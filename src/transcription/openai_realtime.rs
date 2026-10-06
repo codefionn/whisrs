@@ -9,7 +9,7 @@ use super::openai_realtime_protocol::{
     openai_turn_detection_mode_for_model, OpenAiRealtimeProfile, OpenAiRealtimeProtocolEngine,
     RealtimeEngineConfig, TurnDetectionMode,
 };
-use super::{TranscriptionBackend, TranscriptionConfig};
+use super::{ModelUnload, TranscriptionBackend, TranscriptionConfig};
 
 /// OpenAI Realtime API transcription backend.
 pub struct OpenAIRealtimeBackend {
@@ -75,6 +75,10 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
 
     fn supports_streaming(&self) -> bool {
         true
+    }
+
+    fn unload_model(&self) -> ModelUnload {
+        ModelUnload::NoLocalModel
     }
 
     // Per request, not per backend: the model picks the turn-detection mode,
